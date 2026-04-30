@@ -1,14 +1,16 @@
 import os
 import sqlite3
-import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-# ===== ENV =====
+# ===== ENV CONFIG =====
 TOKEN = os.getenv("TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+
+if not TOKEN:
+    raise ValueError("TOKEN не найден")
 
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
@@ -19,7 +21,7 @@ cursor = conn.cursor()
 
 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER)")
 cursor.execute("CREATE TABLE IF NOT EXISTS participants (user_id INTEGER, giveaway_id INTEGER, number INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS giveaways (id INTEGER PRIMARY KEY AUTOINCREMENT, win_amount INTEGER, end_time INTEGER, status TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS giveaways (id INTEGER PRIMARY KEY AUTOINCREMENT, win_amount INTEGER, status TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS withdraws (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, link TEXT, status TEXT)")
 conn.commit()
 
@@ -63,8 +65,7 @@ async def profile(call: types.CallbackQuery):
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
 
     await call.message.edit_text(
-        f"👤 <b>{call.from_user.username or call.from_user.id}</b>\n"
-        f"💰 Баланс: <b>{bal}</b>",
+        f"👤 <b>Профиль</b>\n\n💰 Баланс: <b>{bal}</b>",
         reply_markup=kb
     )
 
@@ -82,69 +83,76 @@ async def back(call: types.CallbackQuery):
 # ===== ADMIN =====
 @dp.callback_query_handler(lambda c: c.data == "admin")
 async def admin(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🎁 Создать", callback_data="create"))
-    kb.add(InlineKeyboardButton("📋 Заявки", callback_data="list_w"))
-    kb.add(InlineKeyboardButton("💰 Баланс ±", callback_data="balance_edit"))
+    kb.add(InlineKeyboardButton("🎁 Создать розыгрыш", callback_data="create_give"))
+    kb.add(InlineKeyboardButton("🏁 Завершить розыгрыш", callback_data="finish"))
+    kb.add(InlineKeyboardButton("📥 Заявки", callback_data="withdraws"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
 
-    await call.message.edit_text("🛠 Админка", reply_markup=kb)
+    await call.message.edit_text("🛠 <b>Админ панель</b>", reply_markup=kb)
 
 # ===== STATES =====
-state = {}
+user_state = {}
 
-# ===== CREATE =====
-@dp.callback_query_handler(lambda c: c.data == "create")
-async def create(call: types.CallbackQuery):
-    state[call.from_user.id] = "create"
-    await call.message.answer("Формат: сумма время(сек)\nПример: 50 300")
+# ===== CREATE GIVE =====
+@dp.callback_query_handler(lambda c: c.data == "create_give")
+async def create_give(call: types.CallbackQuery):
+    user_state[call.from_user.id] = "wait_amount"
+    await call.message.answer("💰 Введи сумму выигрыша:")
 
+# ===== WITHDRAW BTN =====
+@dp.callback_query_handler(lambda c: c.data == "withdraw")
+async def withdraw(call: types.CallbackQuery):
+    user_state[call.from_user.id] = "withdraw_amount"
+    await call.message.answer("💸 Введи сумму:")
+
+# ===== ALL TEXT =====
 @dp.message_handler()
-async def text(msg: types.Message):
-    st = state.get(msg.from_user.id)
+async def all_messages(msg: types.Message):
+    state = user_state.get(msg.from_user.id)
 
-    # СОЗДАНИЕ
-    if st == "create":
-        try:
-            amount, time_sec = map(int, msg.text.split())
-        except:
+    # СОЗДАНИЕ РОЗЫГРЫША
+    if state == "wait_amount":
+        if not msg.text.isdigit():
             return
 
-        cursor.execute(
-            "INSERT INTO giveaways (win_amount, end_time, status) VALUES (?, ?, 'active')",
-            (amount, int(asyncio.get_event_loop().time()) + time_sec)
-        )
+        amount = int(msg.text)
+
+        cursor.execute("INSERT INTO giveaways (win_amount, status) VALUES (?, 'active')", (amount,))
         conn.commit()
-        gid = cursor.lastrowid
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🎯 Участвовать", callback_data="join"))
 
         await bot.send_message(
             CHANNEL_ID,
-            f"🎁 Розыгрыш\n💰 {amount}\n⏱ {time_sec} сек",
+            f"🎁 <b>РОЗЫГРЫШ</b>\n\n💰 Выигрыш: <b>{amount}</b>",
             reply_markup=kb
         )
 
-        asyncio.create_task(auto_finish(gid, time_sec))
-        await msg.answer("✅ Создано")
-        state.pop(msg.from_user.id)
+        await msg.answer("✅ Розыгрыш создан")
+        user_state.pop(msg.from_user.id)
 
-    # ВЫВОД
-    elif st == "withdraw":
+    # ВЫВОД СУММЫ
+    elif state == "withdraw_amount":
         if not msg.text.isdigit():
             return
 
         amount = int(msg.text)
+
         if get_balance(msg.from_user.id) < amount:
-            await msg.answer("❌ Нет денег")
+            await msg.answer("❌ Недостаточно средств")
             return
 
-        state[msg.from_user.id] = ("link", amount)
-        await msg.answer("🔗 Ссылка с @BOR_CASINO_BOT")
+        user_state[msg.from_user.id] = ("withdraw_link", amount)
+        await msg.answer("🔗 Скинь ссылку с @BOR_CASINO_BOT")
 
-    elif isinstance(st, tuple):
-        amount = st[1]
+    # ССЫЛКА
+    elif isinstance(state, tuple):
+        amount = state[1]
 
         cursor.execute(
             "INSERT INTO withdraws (user_id, amount, link, status) VALUES (?, ?, ?, 'pending')",
@@ -156,42 +164,18 @@ async def text(msg: types.Message):
 
         kb = InlineKeyboardMarkup()
         kb.add(
-            InlineKeyboardButton("✅", callback_data=f"ok_{wid}"),
-            InlineKeyboardButton("❌", callback_data=f"no_{wid}")
+            InlineKeyboardButton("✅ Подтвердить", callback_data=f"ok_{wid}"),
+            InlineKeyboardButton("❌ Отменить", callback_data=f"no_{wid}")
         )
 
         await bot.send_message(
             ADMIN_ID,
-            f"💸 Заявка\n@{msg.from_user.username}\n💰 {amount}\n{msg.text}",
+            f"💸 Заявка на вывод\n\n👤 {msg.from_user.id}\n💰 {amount}\n🔗 {msg.text}",
             reply_markup=kb
         )
 
-        await msg.answer("⏳ Отправлено")
-        state.pop(msg.from_user.id)
-
-# ===== AUTO FINISH =====
-async def auto_finish(gid, delay):
-    await asyncio.sleep(delay)
-
-    cursor.execute("SELECT win_amount FROM giveaways WHERE id=?", (gid,))
-    amount = cursor.fetchone()[0]
-
-    dice = await bot.send_dice(CHANNEL_ID)
-    num = dice.dice.value
-
-    cursor.execute("SELECT user_id FROM participants WHERE giveaway_id=? AND number=?", (gid, num))
-    winners = cursor.fetchall()
-
-    text = f"🎲 {num}\n🏆 Победители:\n"
-
-    for w in winners:
-        update_balance(w[0], amount)
-        text += f"<blockquote>{w[0]}</blockquote>\n"
-
-    await bot.send_message(CHANNEL_ID, text)
-
-    cursor.execute("UPDATE giveaways SET status='done' WHERE id=?", (gid,))
-    conn.commit()
+        await msg.answer("⏳ Заявка отправлена")
+        user_state.pop(msg.from_user.id)
 
 # ===== JOIN =====
 @dp.callback_query_handler(lambda c: c.data == "join")
@@ -202,9 +186,9 @@ async def join(call: types.CallbackQuery):
 
     kb = InlineKeyboardMarkup(row_width=3)
     for i in range(1, 7):
-        kb.insert(InlineKeyboardButton(str(i), callback_data=f"pick_{i}"))
+        kb.insert(InlineKeyboardButton(f"🎯 {i}", callback_data=f"pick_{i}"))
 
-    await call.message.answer("🎲 Выбери:", reply_markup=kb)
+    await call.message.answer("🎲 Выбери число:", reply_markup=kb)
 
 # ===== PICK =====
 @dp.callback_query_handler(lambda c: c.data.startswith("pick_"))
@@ -224,15 +208,38 @@ async def pick(call: types.CallbackQuery):
     cursor.execute("INSERT INTO participants VALUES (?, ?, ?)", (call.from_user.id, gid, num))
     conn.commit()
 
-    await call.answer(f"✅ {num}")
+    await call.answer(f"✅ Выбрано {num}")
 
-# ===== WITHDRAW BTN =====
-@dp.callback_query_handler(lambda c: c.data == "withdraw")
-async def withdraw(call: types.CallbackQuery):
-    state[call.from_user.id] = "withdraw"
-    await call.message.answer("💸 Сумма:")
+# ===== FINISH =====
+@dp.callback_query_handler(lambda c: c.data == "finish")
+async def finish(call: types.CallbackQuery):
+    g = get_active()
+    if not g:
+        return
 
-# ===== ADMIN ACTIONS =====
+    gid, amount = g
+
+    dice = await bot.send_dice(CHANNEL_ID)
+    num = dice.dice.value
+
+    cursor.execute("SELECT user_id FROM participants WHERE giveaway_id=? AND number=?", (gid, num))
+    winners = cursor.fetchall()
+
+    text = f"🎲 Выпало: <b>{num}</b>\n\n🏆 Победители:\n"
+
+    if not winners:
+        text += "❌ Нет победителей"
+    else:
+        for w in winners:
+            update_balance(w[0], amount)
+            text += f"<blockquote>{w[0]}</blockquote>\n"
+
+    await bot.send_message(CHANNEL_ID, text)
+
+    cursor.execute("UPDATE giveaways SET status='done' WHERE id=?", (gid,))
+    conn.commit()
+
+# ===== ADMIN CONFIRM =====
 @dp.callback_query_handler(lambda c: c.data.startswith("ok_"))
 async def ok(call: types.CallbackQuery):
     wid = int(call.data.split("_")[1])
@@ -254,7 +261,7 @@ async def no(call: types.CallbackQuery):
     cursor.execute("UPDATE withdraws SET status='cancel' WHERE id=?", (wid,))
     conn.commit()
 
-    await call.message.edit_text("❌ Отмена")
+    await call.message.edit_text("❌ Отменено")
 
 # ===== RUN =====
 if __name__ == "__main__":
