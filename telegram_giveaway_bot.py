@@ -1,268 +1,280 @@
 import os
-import sqlite3
-from aiogram import Bot, Dispatcher, types
+import asyncio
+import json
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
+from aiogram.enums import ChatMemberStatus
+from aiogram.filters import CommandStart
+from dotenv import load_dotenv
 
-# ===== ENV CONFIG =====
-TOKEN = os.getenv("TOKEN")
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-if not TOKEN:
-    raise ValueError("TOKEN не найден")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot)
+DB_FILE = "db.json"
 
-# ===== DB =====
-conn = sqlite3.connect("db.db")
-cursor = conn.cursor()
+# ================= БАЗА =================
+def load_db():
+    try:
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"users": {}, "withdraws": []}
 
-cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS participants (user_id INTEGER, giveaway_id INTEGER, number INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS giveaways (id INTEGER PRIMARY KEY AUTOINCREMENT, win_amount INTEGER, status TEXT)")
-cursor.execute("CREATE TABLE IF NOT EXISTS withdraws (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, link TEXT, status TEXT)")
-conn.commit()
+def save_db():
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f)
 
-# ===== FUNCS =====
-def add_user(uid):
-    cursor.execute("INSERT OR IGNORE INTO users VALUES (?, 0)", (uid,))
-    conn.commit()
+db = load_db()
 
-def get_balance(uid):
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
-    return cursor.fetchone()[0]
+# ================= СОСТОЯНИЯ =================
+withdraw_state = {}
+admin_state = {}
 
-def update_balance(uid, amount):
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
-    conn.commit()
+giveaway = {
+    "active": False,
+    "choices": {},
+    "stats": {i: 0 for i in range(1, 7)},
+    "message_id": None,
+    "prize": 0
+}
 
-def get_active():
-    cursor.execute("SELECT id, win_amount FROM giveaways WHERE status='active'")
-    return cursor.fetchone()
+# ================= КНОПКИ =================
+def main_menu(uid):
+    kb = [
+        [InlineKeyboardButton(text="🎲 Участвовать", callback_data="participate")],
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="💸 Вывести", callback_data="withdraw")]
+    ]
 
-# ===== START =====
-@dp.message_handler(commands=['start'])
+    if uid == ADMIN_ID:
+        kb.append([InlineKeyboardButton(text="⚙️ Админка", callback_data="admin")])
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def numbers_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(i), callback_data=f"num_{i}") for i in range(1, 7)]
+    ])
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Создать розыгрыш", callback_data="admin_create")],
+        [InlineKeyboardButton(text="💰 Выдать баланс", callback_data="admin_add")],
+        [InlineKeyboardButton(text="📊 Пользователи", callback_data="admin_users")]
+    ])
+
+# ================= ПОДПИСКА =================
+async def check_sub(user_id):
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except:
+        return False
+
+# ================= СТАРТ =================
+@dp.message(CommandStart())
 async def start(msg: types.Message):
-    add_user(msg.from_user.id)
+    uid = msg.from_user.id
 
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("👤 ПРОФИЛЬ", callback_data="profile"))
+    if str(uid) not in db["users"]:
+        db["users"][str(uid)] = {"balance": 0}
+        save_db()
 
-    if msg.from_user.id == ADMIN_ID:
-        kb.add(InlineKeyboardButton("🛠 АДМИНКА", callback_data="admin"))
+    if not await check_sub(uid):
+        await msg.answer("❗ Подпишись на канал")
+        return
 
-    await msg.answer("🎲 <b>Wins Rush</b>", reply_markup=kb)
+    await msg.answer("Главное меню:", reply_markup=main_menu(uid))
 
-# ===== PROFILE =====
-@dp.callback_query_handler(lambda c: c.data == "profile")
+# ================= ПРОФИЛЬ =================
+@dp.callback_query(F.data == "profile")
 async def profile(call: types.CallbackQuery):
-    bal = get_balance(call.from_user.id)
+    uid = str(call.from_user.id)
+    bal = db["users"][uid]["balance"]
 
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("💸 Вывести", callback_data="withdraw"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
+    await call.message.answer(f"👤 ID: {uid}\n💰 Баланс: {bal}")
 
-    await call.message.edit_text(
-        f"👤 <b>Профиль</b>\n\n💰 Баланс: <b>{bal}</b>",
-        reply_markup=kb
-    )
+# ================= УЧАСТИЕ =================
+@dp.callback_query(F.data == "participate")
+async def participate(call: types.CallbackQuery):
+    uid = str(call.from_user.id)
 
-# ===== BACK =====
-@dp.callback_query_handler(lambda c: c.data == "back")
-async def back(call: types.CallbackQuery):
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("👤 ПРОФИЛЬ", callback_data="profile"))
+    if not giveaway["active"]:
+        await call.answer("Нет активного розыгрыша", show_alert=True)
+        return
 
-    if call.from_user.id == ADMIN_ID:
-        kb.add(InlineKeyboardButton("🛠 АДМИНКА", callback_data="admin"))
+    if uid in giveaway["choices"]:
+        await call.answer("Ты уже участвовал", show_alert=True)
+        return
 
-    await call.message.edit_text("🎲 <b>Wins Rush</b>", reply_markup=kb)
+    await call.message.answer("Выбери число:", reply_markup=numbers_kb())
 
-# ===== ADMIN =====
-@dp.callback_query_handler(lambda c: c.data == "admin")
-async def admin(call: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("num_"))
+async def choose(call: types.CallbackQuery):
+    uid = str(call.from_user.id)
+
+    if uid in giveaway["choices"]:
+        await call.answer("Уже выбрал", show_alert=True)
+        return
+
+    num = int(call.data.split("_")[1])
+    giveaway["choices"][uid] = num
+    giveaway["stats"][num] += 1
+
+    await call.answer("Принято")
+    await update_post()
+
+# ================= ОБНОВЛЕНИЕ =================
+async def update_post():
+    if giveaway["message_id"]:
+        text = "🎲 Розыгрыш\n\n"
+        for i in range(1, 7):
+            text += f"{i}: {giveaway['stats'][i]}\n"
+
+        try:
+            await bot.edit_message_text(CHANNEL_ID, giveaway["message_id"], text)
+        except:
+            pass
+
+# ================= СОЗДАНИЕ =================
+@dp.callback_query(F.data == "admin_create")
+async def admin_create(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
 
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🎁 Создать розыгрыш", callback_data="create_give"))
-    kb.add(InlineKeyboardButton("🏁 Завершить розыгрыш", callback_data="finish"))
-    kb.add(InlineKeyboardButton("📥 Заявки", callback_data="withdraws"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
+    admin_state[call.from_user.id] = "create"
+    await call.message.answer("Введи: время(сек) приз")
 
-    await call.message.edit_text("🛠 <b>Админ панель</b>", reply_markup=kb)
+@dp.message()
+async def admin_inputs(msg: types.Message):
+    uid = msg.from_user.id
 
-# ===== STATES =====
-user_state = {}
+    if uid not in admin_state:
+        return
 
-# ===== CREATE GIVE =====
-@dp.callback_query_handler(lambda c: c.data == "create_give")
-async def create_give(call: types.CallbackQuery):
-    user_state[call.from_user.id] = "wait_amount"
-    await call.message.answer("💰 Введи сумму выигрыша:")
+    if admin_state[uid] == "create":
+        sec, prize = msg.text.split()
 
-# ===== WITHDRAW BTN =====
-@dp.callback_query_handler(lambda c: c.data == "withdraw")
-async def withdraw(call: types.CallbackQuery):
-    user_state[call.from_user.id] = "withdraw_amount"
-    await call.message.answer("💸 Введи сумму:")
+        giveaway.update({
+            "active": True,
+            "choices": {},
+            "stats": {i: 0 for i in range(1, 7)},
+            "prize": int(prize)
+        })
 
-# ===== ALL TEXT =====
-@dp.message_handler()
-async def all_messages(msg: types.Message):
-    state = user_state.get(msg.from_user.id)
-
-    # СОЗДАНИЕ РОЗЫГРЫША
-    if state == "wait_amount":
-        if not msg.text.isdigit():
-            return
-
-        amount = int(msg.text)
-
-        cursor.execute("INSERT INTO giveaways (win_amount, status) VALUES (?, 'active')", (amount,))
-        conn.commit()
-
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🎯 Участвовать", callback_data="join"))
-
-        await bot.send_message(
+        sent = await bot.send_message(
             CHANNEL_ID,
-            f"🎁 <b>РОЗЫГРЫШ</b>\n\n💰 Выигрыш: <b>{amount}</b>",
-            reply_markup=kb
+            "🎲 Новый розыгрыш\nЖми участвовать 👇",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="Участвовать", url=f"https://t.me/{(await bot.me()).username}?start=play")]]
+            )
         )
 
-        await msg.answer("✅ Розыгрыш создан")
-        user_state.pop(msg.from_user.id)
+        giveaway["message_id"] = sent.message_id
 
-    # ВЫВОД СУММЫ
-    elif state == "withdraw_amount":
-        if not msg.text.isdigit():
-            return
+        await msg.answer("Запущено")
 
-        amount = int(msg.text)
+        del admin_state[uid]
 
-        if get_balance(msg.from_user.id) < amount:
-            await msg.answer("❌ Недостаточно средств")
-            return
+        await asyncio.sleep(int(sec))
+        await finish()
 
-        user_state[msg.from_user.id] = ("withdraw_link", amount)
-        await msg.answer("🔗 Скинь ссылку с @BOR_CASINO_BOT")
-
-    # ССЫЛКА
-    elif isinstance(state, tuple):
-        amount = state[1]
-
-        cursor.execute(
-            "INSERT INTO withdraws (user_id, amount, link, status) VALUES (?, ?, ?, 'pending')",
-            (msg.from_user.id, amount, msg.text)
-        )
-        conn.commit()
-
-        wid = cursor.lastrowid
-
-        kb = InlineKeyboardMarkup()
-        kb.add(
-            InlineKeyboardButton("✅ Подтвердить", callback_data=f"ok_{wid}"),
-            InlineKeyboardButton("❌ Отменить", callback_data=f"no_{wid}")
-        )
-
-        await bot.send_message(
-            ADMIN_ID,
-            f"💸 Заявка на вывод\n\n👤 {msg.from_user.id}\n💰 {amount}\n🔗 {msg.text}",
-            reply_markup=kb
-        )
-
-        await msg.answer("⏳ Заявка отправлена")
-        user_state.pop(msg.from_user.id)
-
-# ===== JOIN =====
-@dp.callback_query_handler(lambda c: c.data == "join")
-async def join(call: types.CallbackQuery):
-    g = get_active()
-    if not g:
-        return
-
-    kb = InlineKeyboardMarkup(row_width=3)
-    for i in range(1, 7):
-        kb.insert(InlineKeyboardButton(f"🎯 {i}", callback_data=f"pick_{i}"))
-
-    await call.message.answer("🎲 Выбери число:", reply_markup=kb)
-
-# ===== PICK =====
-@dp.callback_query_handler(lambda c: c.data.startswith("pick_"))
-async def pick(call: types.CallbackQuery):
-    num = int(call.data.split("_")[1])
-    g = get_active()
-    if not g:
-        return
-
-    gid = g[0]
-
-    cursor.execute("SELECT * FROM participants WHERE user_id=? AND giveaway_id=?", (call.from_user.id, gid))
-    if cursor.fetchone():
-        await call.answer("❌ Уже выбрал")
-        return
-
-    cursor.execute("INSERT INTO participants VALUES (?, ?, ?)", (call.from_user.id, gid, num))
-    conn.commit()
-
-    await call.answer(f"✅ Выбрано {num}")
-
-# ===== FINISH =====
-@dp.callback_query_handler(lambda c: c.data == "finish")
-async def finish(call: types.CallbackQuery):
-    g = get_active()
-    if not g:
-        return
-
-    gid, amount = g
+# ================= ФИНИШ =================
+async def finish():
+    giveaway["active"] = False
 
     dice = await bot.send_dice(CHANNEL_ID)
-    num = dice.dice.value
+    result = dice.dice.value
 
-    cursor.execute("SELECT user_id FROM participants WHERE giveaway_id=? AND number=?", (gid, num))
-    winners = cursor.fetchall()
+    winners = [u for u, n in giveaway["choices"].items() if n == result]
 
-    text = f"🎲 Выпало: <b>{num}</b>\n\n🏆 Победители:\n"
+    for uid in winners:
+        db["users"].setdefault(uid, {"balance": 0})
+        db["users"][uid]["balance"] += giveaway["prize"]
 
-    if not winners:
-        text += "❌ Нет победителей"
-    else:
-        for w in winners:
-            update_balance(w[0], amount)
-            text += f"<blockquote>{w[0]}</blockquote>\n"
+    save_db()
 
-    await bot.send_message(CHANNEL_ID, text)
+    await bot.send_message(CHANNEL_ID, f"🎲 Выпало: {result}\n🏆 Победителей: {len(winners)}")
 
-    cursor.execute("UPDATE giveaways SET status='done' WHERE id=?", (gid,))
-    conn.commit()
+# ================= ВЫВОД =================
+@dp.callback_query(F.data == "withdraw")
+async def withdraw(call: types.CallbackQuery):
+    withdraw_state[call.from_user.id] = "amount"
+    await call.message.answer("Введите сумму:")
 
-# ===== ADMIN CONFIRM =====
-@dp.callback_query_handler(lambda c: c.data.startswith("ok_"))
-async def ok(call: types.CallbackQuery):
-    wid = int(call.data.split("_")[1])
+@dp.message(F.text.regexp(r"^\d+$"))
+async def withdraw_amount(msg: types.Message):
+    uid = msg.from_user.id
 
-    cursor.execute("SELECT user_id, amount FROM withdraws WHERE id=?", (wid,))
-    uid, amount = cursor.fetchone()
+    if uid not in withdraw_state:
+        return
 
-    update_balance(uid, -amount)
+    amount = int(msg.text)
 
-    cursor.execute("UPDATE withdraws SET status='done' WHERE id=?", (wid,))
-    conn.commit()
+    if db["users"][str(uid)]["balance"] < amount:
+        await msg.answer("Недостаточно средств")
+        return
 
-    await call.message.edit_text("✅ Выплачено")
+    withdraw_state[uid] = {"amount": amount}
 
-@dp.callback_query_handler(lambda c: c.data.startswith("no_"))
-async def no(call: types.CallbackQuery):
-    wid = int(call.data.split("_")[1])
+    await msg.answer(f"Отправь ссылку из BOR_CASINO_BOT на сумму {amount}")
 
-    cursor.execute("UPDATE withdraws SET status='cancel' WHERE id=?", (wid,))
-    conn.commit()
+@dp.message(F.text.startswith("http"))
+async def withdraw_link(msg: types.Message):
+    uid = msg.from_user.id
 
-    await call.message.edit_text("❌ Отменено")
+    if uid not in withdraw_state or not isinstance(withdraw_state[uid], dict):
+        return
 
-# ===== RUN =====
+    data = withdraw_state[uid]
+    amount = data["amount"]
+
+    db["users"][str(uid)]["balance"] -= amount
+
+    req = {"uid": uid, "amount": amount, "link": msg.text}
+    db["withdraws"].append(req)
+    save_db()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅", callback_data=f"ok_{len(db['withdraws'])-1}"),
+         InlineKeyboardButton(text="❌", callback_data=f"no_{len(db['withdraws'])-1}")]
+    ])
+
+    await bot.send_message(ADMIN_ID, f"Заявка\n{uid}\n{amount}\n{msg.text}", reply_markup=kb)
+    await msg.answer("Заявка отправлена")
+
+    del withdraw_state[uid]
+
+# ================= АДМИН =================
+@dp.callback_query(F.data == "admin")
+async def admin_panel(call: types.CallbackQuery):
+    if call.from_user.id == ADMIN_ID:
+        await call.message.answer("Админ панель:", reply_markup=admin_kb())
+
+@dp.callback_query(F.data.startswith("ok_") | F.data.startswith("no_"))
+async def admin_decision(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    action, i = call.data.split("_")
+    i = int(i)
+    req = db["withdraws"][i]
+
+    if action == "no":
+        db["users"][str(req["uid"])]["balance"] += req["amount"]
+
+    save_db()
+    await call.message.edit_text("Готово")
+
+# ================= ЗАПУСК =================
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
